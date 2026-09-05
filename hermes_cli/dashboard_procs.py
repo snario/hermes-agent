@@ -523,10 +523,18 @@ _REMOTE_LOCK_SUBDIR = "desktop-ssh"
 _HEX32 = set("0123456789abcdef")
 
 
-def _hermes_home_dir() -> Path:
-    """Resolved Hermes home (HERMES_HOME override or ~/.hermes)."""
-    override = os.environ.get("HERMES_HOME", "").strip()
-    return Path(override).expanduser() if override else Path.home() / ".hermes"
+def _desktop_ssh_lock_roots() -> tuple[Path, ...]:
+    """Machine-wide Desktop SSH roots, independent of the active profile."""
+    from hermes_constants import get_default_hermes_root
+    configured = get_default_hermes_root() / _REMOTE_LOCK_SUBDIR
+    if sys.platform == "win32":
+        return (configured,)
+    # The POSIX Desktop writer uses the account-native root even when a custom
+    # HERMES_HOME is active. Keep scanning a configured custom root as well for
+    # existing installs and update cleanup callers that place locks there.
+    from hermes_constants import _get_platform_default_hermes_home
+    native = _get_platform_default_hermes_home() / _REMOTE_LOCK_SUBDIR
+    return (configured,) if configured == native else (configured, native)
 
 
 def _is_hex(value: object, length: int) -> bool:
@@ -556,29 +564,30 @@ def _valid_lockfile_payload(parsed: object, ownership_id: str) -> bool:
 
 
 def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
-    """PIDs claimed by valid ``{hermes_home}/desktop-ssh/<ownershipId>/backend.lock.json`` records
+    """PIDs claimed by valid machine-level ``desktop-ssh`` ownership records
     (best-effort: a bad record contributes no PID; never raises)."""
     import json
-    root = base_dir if base_dir is not None else _hermes_home_dir() / _REMOTE_LOCK_SUBDIR
     owned: set[int] = set()
-    try:
-        entries = list(root.iterdir()) if root.is_dir() else []
-    except OSError:
-        return owned
-    for entry in entries:
-        ownership_id = entry.name
-        lock_path = entry / "backend.lock.json"
-        try:  # validateOwnershipId(): exactly 32 lowercase hex chars
-            if not entry.is_dir() or not _is_hex(ownership_id, 32) or not lock_path.is_file():
-                continue
-            data = lock_path.read_bytes()
-            if len(data) > 65536:
-                continue
-            parsed = json.loads(data)
-        except (OSError, UnicodeDecodeError, ValueError):
+    roots = (base_dir,) if base_dir is not None else _desktop_ssh_lock_roots()
+    for root in roots:
+        try:
+            entries = list(root.iterdir()) if root.is_dir() else []
+        except OSError:
             continue
-        if _valid_lockfile_payload(parsed, ownership_id):
-            owned.add(parsed["pid"])  # validated as int above
+        for entry in entries:
+            ownership_id = entry.name
+            lock_path = entry / "backend.lock.json"
+            try:  # validateOwnershipId(): exactly 32 lowercase hex chars
+                if not entry.is_dir() or not _is_hex(ownership_id, 32) or not lock_path.is_file():
+                    continue
+                data = lock_path.read_bytes()
+                if len(data) > 65536:
+                    continue
+                parsed = json.loads(data)
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            if _valid_lockfile_payload(parsed, ownership_id):
+                owned.add(parsed["pid"])  # validated as int above
     return owned
 
 
