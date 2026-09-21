@@ -12,6 +12,39 @@ VERSION_URL = f"{HTTP_URL}/json/version"
 
 
 class TestResolveCdpOverride:
+    def test_local_discovery_disabled_refreshes_browser_address(self, tmp_path, monkeypatch):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from threading import Thread
+
+        class DisabledDiscovery(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        active = tmp_path / "Library/Application Support/Dia/User Data/DevToolsActivePort"
+        active.parent.mkdir(parents=True)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DisabledDiscovery)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_port
+        raw = f"http://127.0.0.1:{port}"
+        try:
+            for identity in ("first-browser", "after-restart"):
+                active.write_text(f"{port}\n/devtools/browser/{identity}\n")
+                assert bt_cdp._resolve_cdp_override(raw) == f"ws://127.0.0.1:{port}/devtools/browser/{identity}"
+            active.write_text(f"{port + 1}\n/devtools/browser/wrong-port\n")
+            assert bt_cdp._resolve_cdp_override(raw) == raw
+            active.write_text(f"{port}\n/devtools/browser/local-only\n")
+            assert bt_cdp._local_devtools_websocket(f"http://example.com:{port}") == ""
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_keeps_full_devtools_websocket_url(self):
         from tools.browser_tool_cdp import _resolve_cdp_override
 

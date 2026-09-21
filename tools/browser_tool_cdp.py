@@ -4,10 +4,33 @@ Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt
 
 import contextlib
 import os
+import re
+from pathlib import Path
 from typing import Tuple
+from urllib.parse import urlsplit
 
-from agent.proxy_bypass import loopback_request_kwargs
+from agent.proxy_bypass import is_loopback_host, loopback_request_kwargs
 from tools.browser_tool_origin import origin_module as _origin
+
+
+def _local_devtools_websocket(discovery_url: str) -> str:
+    """Default Chromium profiles may expose CDP while disabling /json/version."""
+    parsed = urlsplit(discovery_url)
+    if parsed.scheme != "http" or not is_loopback_host(parsed.hostname) or not parsed.port:
+        return ""
+    from hermes_cli.browser_connect import real_profile_data_dir
+
+    roots = [Path.home() / "Library/Application Support/Dia/User Data"]
+    roots.extend(Path(p) for browser in ("chrome", "edge", "brave", "brave-origin", "chromium")
+                 if (p := real_profile_data_dir(browser)))
+    for root in roots:
+        try:
+            port, path = (root / "DevToolsActivePort").read_text().splitlines()
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if port == str(parsed.port) and re.fullmatch(r"/devtools/browser/[A-Za-z0-9_-]+", path):
+            return f"ws://{parsed.netloc}{path}"
+    return ""
 
 
 def _resolve_cdp_override(cdp_url: str) -> str:
@@ -38,6 +61,10 @@ def _resolve_cdp_override(cdp_url: str) -> str:
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
+        if getattr(getattr(exc, "response", None), "status_code", None) == 404:
+            with contextlib.suppress(ValueError):
+                if ws_url := _local_devtools_websocket(discovery_url):
+                    return ws_url
         _bt.logger.warning("Failed to resolve CDP endpoint %s via %s: %s", san(raw), san(version_url), san(exc))
         return raw
     ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
