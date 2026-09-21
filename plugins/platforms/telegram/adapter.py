@@ -2723,16 +2723,25 @@ class TelegramAdapter(BasePlatformAdapter):
         """Register the command menu (from COMMAND_REGISTRY) in every scope — Telegram picks the
         narrowest matching one per chat type; forum topics are handled lazily by _ensure_forum_commands."""
         from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeDefault
-        from hermes_cli.commands_platforms import telegram_menu_commands, telegram_menu_max_commands
         if not self._bot:
             return
+        scope_classes = (BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats)
+        menu_config = self.config.extra.get("command_menu")
+        if isinstance(menu_config, dict) and menu_config.get("enabled") is False:
+            for scope_cls in scope_classes:
+                try:
+                    await self._bot.delete_my_commands(scope=scope_cls())
+                except Exception as scope_err:
+                    logger.warning("[%s] delete_my_commands FAILED for scope %s: %s", self.name, scope_cls.__name__, scope_err)
+            return
+        from hermes_cli.commands_platforms import telegram_menu_commands, telegram_menu_max_commands
         # Telegram allows 100 commands but has an undocumented ~4KB payload limit; default cap 60.
         max_commands = telegram_menu_max_commands()
         # Skill discovery resolves every skill path on disk; a slow filesystem after a reconnect must
         # not hold the gateway loop past the liveness watchdog (#110707). Only the Bot API call stays here.
         menu_commands, hidden_count = await asyncio.to_thread(telegram_menu_commands, max_commands=max_commands)
         bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
-        for scope_cls in (BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats):
+        for scope_cls in scope_classes:
             scope_name = getattr(scope_cls, "__name__", str(scope_cls))
             try:
                 await self._bot.set_my_commands(bot_commands, scope=scope_cls())
@@ -6305,6 +6314,9 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _ensure_forum_commands(self, message) -> None:
         """Lazy-register bot commands for forum supergroups (topics don't inherit AllGroupChats scope;
         Telegram resolves via BotCommandScopeChat)."""
+        menu_config = self.config.extra.get("command_menu")
+        if isinstance(menu_config, dict) and menu_config.get("enabled") is False:
+            return
         async with self._forum_lock:
             try:
                 chat = getattr(message, "chat", None)

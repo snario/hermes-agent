@@ -20,9 +20,21 @@ def _make_test_adapter():
     # ``name`` is a property derived from platform.value.title()
     adapter._bot = MagicMock()
     adapter._bot.set_my_commands = AsyncMock()
+    adapter._bot.delete_my_commands = AsyncMock()
     adapter._forum_command_registered = set()
     adapter._forum_lock = asyncio.Lock()
     return adapter
+
+
+@pytest.mark.asyncio
+async def test_disabled_command_menu_clears_public_scopes():
+    adapter = _make_test_adapter()
+    adapter.config.extra["command_menu"] = {"enabled": False}
+
+    await adapter._register_command_menu()
+
+    assert adapter._bot.delete_my_commands.await_count == 3
+    adapter._bot.set_my_commands.assert_not_awaited()
 
 
 def _forum_message(chat_id=-100, is_forum=True):
