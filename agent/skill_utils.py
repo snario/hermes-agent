@@ -259,6 +259,16 @@ def _skills_cfg_get(key: str) -> Any:
     return skills_cfg.get(key) if skills_cfg is not None else None
 
 
+def get_skill_context_options() -> Tuple[frozenset, bool]:
+    """Opt-in presentation/loading policy; never disables or auto-loads skills."""
+    cfg = _skills_cfg() or {}
+    categories = cfg.get("index_compact_categories", [])
+    if not isinstance(categories, list):
+        categories = []
+    return (frozenset(c.strip() for c in categories if isinstance(c, str) and c.strip()),
+            cfg.get("loading") == "focused")
+
+
 def _expand_path(entry: str) -> Path:
     """Expand ``~`` and ``${VAR}`` in a config path entry."""
     return Path(os.path.expanduser(os.path.expandvars(entry)))

@@ -1336,6 +1336,7 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
     compact_categories: "frozenset[str] | None", available_tools: "set[str] | None",
+    focused_loading: bool = False,
 ) -> str:
     """Render the ## Skills block; "" when there is nothing to list."""
     if not skills_by_category:
@@ -1344,7 +1345,7 @@ def _render_skills_index(
     # model's project memory and it won't rediscover them via skills_list. Nested categories follow their parent.
     demoted = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or frozenset()))
     hidden_note = (
-        "\n(Categories marked [names only] are outside the current coding "
+        "\n(Categories marked [names only] are outside the current task "
         "context, so their descriptions are omitted — the skills work "
         "normally and load with skill_view(name) as usual.)"
     ) if demoted else ""
@@ -1369,6 +1370,18 @@ def _render_skills_index(
             ONESHOT_SKILLS_LOAD_GUIDANCE
             + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
             + hidden_note
+        )
+    if focused_loading:
+        return (
+            "## Skills\n"
+            "Load the most specific applicable skill before specialized work, plus any skills "
+            "explicitly requested by the user or required by the active workflow. Add supporting "
+            "skills when an actual dependency requires them. Mere keyword overlap is not a reason "
+            "to load unrelated skills. Read linked references only when needed for the current step. "
+            "Preserve all account, authorization, and verification rules in the skills you use. "
+            "Every listed skill remains available through skill_view(name). "
+            "For a simple answer with no applicable workflow, answer directly.\n"
+            "<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>" + hidden_note
         )
     return (
         "## Skills\n"
@@ -1403,6 +1416,9 @@ def _build_skills_system_prompt_inner(
     available_toolsets: "set[str] | None", compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
 ) -> str:
+    from agent.skill_utils import get_skill_context_options
+    configured_compact, focused_loading = get_skill_context_options()
+    compact_categories = frozenset(compact_categories or ()) | configured_compact
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
@@ -1412,7 +1428,7 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
-        _oneshot_prompt_variant(),
+        _oneshot_prompt_variant(), focused_loading,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1470,7 +1486,8 @@ def _build_skills_system_prompt_inner(
         for cat, cat_desc in _read_category_descriptions(ext_dir, "Could not read external skill description %s: %s").items():
             category_descriptions.setdefault(cat, cat_desc)
 
-    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools)
+    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools,
+                                  focused_loading=focused_loading)
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)

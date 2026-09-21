@@ -61,6 +61,41 @@ def _drain_truncation_warnings():
 # =========================================================================
 
 
+def test_focused_skill_context_is_profile_scoped_and_refreshes_config(tmp_path, monkeypatch):
+    from agent import oneshot_footprint, skill_utils
+
+    monkeypatch.setattr(oneshot_footprint, "is_single_query_session", lambda: False)
+    monkeypatch.setattr(skill_utils, "get_project_skills_dirs", lambda: [])
+    profiles = [tmp_path / name for name in ("focused", "default")]
+    for home in profiles:
+        for category, name, description in (
+            ("creative/images", "draw-image", "Create an illustration"),
+            ("finance", "audit-books", "Audit accounting records"),
+        ):
+            skill = home / "skills" / category / name / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(f"---\nname: {name}\ndescription: {description}\n---\nDetails\n")
+        (home / "config.yaml").write_text("skills: {}\n")
+    config = profiles[0] / "config.yaml"
+    config.write_text("skills:\n  loading: focused\n  index_compact_categories: [creative]\n")
+
+    focused, default, focused_again = [
+        build_skills_system_prompt(skills_dir_override=home / "skills")
+        for home in (profiles[0], profiles[1], profiles[0])
+    ]
+    assert focused == focused_again
+    for prompt in (focused, default):
+        assert "draw-image" in prompt and "audit-books" in prompt
+        assert "Audit accounting records" in prompt
+    assert "Create an illustration" not in focused
+    assert "Create an illustration" in default
+    assert "Load the most specific applicable skill" in focused
+    assert "Before replying, scan the skills below" in default
+
+    config.write_text("skills: {}\n")
+    assert build_skills_system_prompt(skills_dir_override=profiles[0] / "skills") == default
+
+
 class TestGuidanceConstants:
     def test_memory_guidance_keeps_form_rule_and_routing(self):
         """Dieted (#95681): WHAT belongs in memory is the memory tool
