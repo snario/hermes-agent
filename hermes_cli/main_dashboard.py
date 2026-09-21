@@ -371,6 +371,20 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
 
     for command in commands:
         try:
+            # macOS ps expands a venv interpreter to its base Python. Replaying
+            # that path loses pyvenv.cfg and Hermes's installed dependencies.
+            # Recover the interpreter from the captured launcher's shebang,
+            # for Python + Hermes launcher command lines. Framework builds
+            # also report a different executable from the venv symlink target.
+            if (len(command) > 1 and Path(command[1]).name == "hermes"
+                    and Path(command[0]).name.lower().startswith("python")):
+                with contextlib.suppress(OSError, ValueError):
+                    with open(command[1]) as launcher:
+                        shebang = launcher.readline().strip()
+                    interpreter = shebang[2:] if shebang.startswith("#!/") else ""
+                    if (interpreter and os.access(interpreter, os.X_OK)
+                            and Path(interpreter).name.lower().startswith("python")):
+                        command = [interpreter, *command[1:]]
             # Keep restarted dashboards headless; reopening a browser after a
             # background update is noisy and fails in SSH/headless sessions.
             if "dashboard" in command and "--no-open" not in command:
