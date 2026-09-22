@@ -5,6 +5,7 @@ instead of default browser tools
 """
 
 import contextlib
+import hashlib
 import importlib
 import json
 import logging
@@ -13,6 +14,8 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -71,10 +74,37 @@ _hermes_ensure_own_tab()
 del _hermes_ensure_own_tab
 """
 
+# browser-use's real-key fill can wedge on JS-heavy inputs (notably Wix). Keep
+# its normal framework-aware path, then fall back to the native value setter.
+_INPUT_TIMEOUT_FALLBACK_PREAMBLE = """\
+_hermes_fill_input = fill_input
+def fill_input(selector, text, clear_first=True, timeout=0.0):
+    try:
+        return _hermes_fill_input(selector, text, clear_first=clear_first, timeout=timeout)
+    except TimeoutError:
+        import json as _json
+        _selector, _text = _json.dumps(selector), _json.dumps(text)
+        _clear = "true" if clear_first else "false"
+        _ok = js(
+            f"(()=>{{const e=document.querySelector({_selector});if(!e)return false;"
+            f"const p=e instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;"
+            f"const s=Object.getOwnPropertyDescriptor(p,'value').set,v={_text};"
+            f"s.call(e,{_clear}?v:e.value+v);e.dispatchEvent(new InputEvent('input',"
+            f"{{bubbles:true,inputType:'insertText',data:v}}));"
+            f"e.dispatchEvent(new Event('change',{{bubbles:true}}));return true}})()"
+        )
+        if not _ok:
+            raise RuntimeError(f"fill_input: element not found after input timeout: {selector!r}")
+"""
+
 _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
 _STDERR_CAP_CHARS = 4000
+_PERSISTENT_PROFILE_LOCK = threading.Lock()
+_DAEMON_LOCK = threading.Lock()
+_ACTIVE_DAEMONS: set[tuple[str, str]] = set()
+_DAEMON_RUNTIME_DIRS: set[str] = set()
 
 _TASK_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")  # filesystem-safe task ids
 # Screenshot paths printed by capture_screenshot(): POSIX or Windows drive-letter absolute.
@@ -150,7 +180,68 @@ def _base_subprocess_env() -> dict:
     env.pop("PYTHONHOME", None)
     env["PATH"] = _floor_subprocess_path(env.get("PATH", ""))
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
+    runtime = str(_browser_use_runtime_dir())
+    env["BH_RUNTIME_DIR"] = runtime
+    env["BH_RUNTIME_DIR_SHARED"] = "1"
+    with _DAEMON_LOCK:
+        _DAEMON_RUNTIME_DIRS.add(runtime)
     return env
+
+
+def _browser_use_runtime_dir() -> Path:
+    """Short, Hermes-owned daemon socket dir (macOS AF_UNIX paths cap at 104 bytes)."""
+    home = os.path.realpath(str(get_hermes_home()))
+    key = hashlib.sha256(os.fsencode(home)).hexdigest()[:12]
+    root = Path("/tmp") if os.name != "nt" else Path(tempfile.gettempdir())
+    return root / f"hermes-bu-{key}"
+
+
+def _set_daemon_active(runtime: str, name: str, active: bool) -> None:
+    key = (runtime, name)
+    with _DAEMON_LOCK:
+        (_ACTIVE_DAEMONS.add if active else _ACTIVE_DAEMONS.discard)(key)
+    if not active:
+        with contextlib.suppress(OSError):
+            (Path(runtime) / f"bu-{name}.pid").touch()
+
+
+def _stop_browser_use_daemon(runtime: str, name: str) -> bool:
+    cmd = _find_cli()
+    if not cmd:
+        return False
+    env = _base_subprocess_env()
+    env.update({"BH_RUNTIME_DIR": runtime, "BH_RUNTIME_DIR_SHARED": "1", "BU_NAME": name})
+    try:
+        return subprocess.run(
+            [*cmd, "--reload"], env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
+            check=False,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def cleanup_inactive_browser_use_daemons(*, close_all: bool = False, now: Optional[float] = None) -> int:
+    """Stop Hermes-owned harness daemons after the normal browser inactivity timeout."""
+    from tools.browser_tool import BROWSER_SESSION_INACTIVITY_TIMEOUT
+
+    now = time.time() if now is None else now
+    with _DAEMON_LOCK:
+        runtime_dirs = tuple(_DAEMON_RUNTIME_DIRS)
+        active = set(_ACTIVE_DAEMONS)
+    stopped = 0
+    for runtime in runtime_dirs:
+        for pid_file in Path(runtime).glob("bu-*.pid"):
+            name = pid_file.name[3:-4]
+            if not name or (runtime, name) in active:
+                continue
+            try:
+                stale = now - pid_file.stat().st_mtime > BROWSER_SESSION_INACTIVITY_TIMEOUT
+            except OSError:
+                continue
+            if (close_all or stale) and _stop_browser_use_daemon(runtime, name):
+                stopped += 1
+    return stopped
 
 
 def _floor_subprocess_path(path: str) -> str:
@@ -410,14 +501,32 @@ def _resolve_managed_chromium_cdp(env: dict, task_id: Optional[str], session_nam
     except Exception as e:  # pragma: no cover — stubbed browser_tool in tests
         logger.debug("managed chromium resolution unavailable: %s", e)
         return None
-    res = _run_browser_command(_backend_cache_key(task_id, session_name), "get", ["cdp-url"],
-                               timeout=_get_open_command_timeout(first_open=True))
+    profile = os.path.expanduser(str(env.get("AGENT_BROWSER_PROFILE") or "").strip())
+    persistent_profile = profile if os.path.isabs(profile) else ""
+    if persistent_profile:
+        profile_key = "persistent-profile-" + hashlib.sha256(os.fsencode(os.path.realpath(profile))).hexdigest()[:12]
+        cache_key = _backend_cache_key(profile_key)
+    else:
+        cache_key = _backend_cache_key(task_id, session_name)
+
+    with _PERSISTENT_PROFILE_LOCK if persistent_profile else contextlib.nullcontext():
+        if persistent_profile:
+            try:
+                from tools.browser_tool_real_profile import _surviving_chrome_cdp
+                if cdp := _surviving_chrome_cdp(persistent_profile):
+                    _set_cdp_env(env, cdp)
+                    return None
+            except Exception as e:
+                logger.debug("persistent browser profile reuse unavailable: %s", e)
+        res = _run_browser_command(cache_key, "get", ["cdp-url"],
+                                   timeout=_get_open_command_timeout(first_open=True))
     cdp = str(((res or {}).get("data") or {}).get("cdpUrl") or "") if (res or {}).get("success") else ""
     if not cdp:
         return (f"The local browser could not be started: {(res or {}).get('error') or 'agent-browser returned no CDP endpoint'} "
                 "Run `hermes tools` → Browser Automation to (re)install Chromium, or switch backends.")
     _set_cdp_env(env, cdp)
-    env[_PRIVATE_BROWSER_SENTINEL] = "1"  # one Chromium per cache key: nothing to share a tab with
+    if not persistent_profile:
+        env[_PRIVATE_BROWSER_SENTINEL] = "1"  # one Chromium per cache key: nothing to share a tab with
     return None
 
 
@@ -622,6 +731,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
                           "then run `browser-use --doctor` to verify the setup.")
 
     env = _base_subprocess_env()
+    from tools.browser_tool_lifecycle import _start_browser_cleanup_thread
+    _start_browser_cleanup_thread()
     if session:
         if not _SESSION_RE.match(session):
             return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
@@ -635,6 +746,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
     # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
+    code = _INPUT_TIMEOUT_FALLBACK_PREAMBLE + code
     if session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
@@ -649,6 +761,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
     timeout = _clamp_timeout(timeout_s)
     started = time.time()
+    daemon_runtime = env["BH_RUNTIME_DIR"]
+    daemon_name = session or "default"
+    _set_daemon_active(daemon_runtime, daemon_name, True)
     try:
         proc = _run_cli_killing_process_group(cmd, code, env, timeout)
     except subprocess.TimeoutExpired:
@@ -657,6 +772,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
                           "append to workspace files — anything already written to the workspace is preserved.")
     except OSError as e:
         return tool_error(f"Failed to launch browser-use CLI: {e}")
+    finally:
+        _set_daemon_active(daemon_runtime, daemon_name, False)
 
     # browser_vault_fill registers injected values with this forced model-egress
     # boundary. Preserve raw stdout only for screenshot-path detection below.

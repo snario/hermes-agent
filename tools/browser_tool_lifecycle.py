@@ -100,6 +100,11 @@ def _emergency_cleanup_all_sessions():
                 _bt._recording_sessions.clear()
     # Lightpanda servers we spawned that fell out of ``_active_sessions``.
     _best_effort("Lightpanda cleanup on exit", _stop_all_lightpanda)
+    _best_effort(
+        "Browser Use daemon cleanup on exit",
+        lambda: __import__("tools.browser_use_cli", fromlist=["cleanup_inactive_browser_use_daemons"])
+        .cleanup_inactive_browser_use_daemons(close_all=True),
+    )
     # Safe even if we never used the browser — owner_pid liveness protects daemons
     # owned by other live hermes processes.
     _best_effort("Orphan reap on exit", _reap_orphaned_browser_sessions)
@@ -414,6 +419,8 @@ def _browser_cleanup_thread_worker():
 
         try:
             _cleanup_inactive_browser_sessions()
+            from tools.browser_use_cli import cleanup_inactive_browser_use_daemons
+            cleanup_inactive_browser_use_daemons()
         except Exception as e:
             _bt.logger.warning("Cleanup thread error: %s", e)
 
@@ -711,6 +718,12 @@ def cleanup_all_browsers() -> None:
         SUPERVISOR_REGISTRY.stop_all()
     except Exception:
         pass
+
+    _best_effort(
+        "Browser Use daemon cleanup",
+        lambda: __import__("tools.browser_use_cli", fromlist=["cleanup_inactive_browser_use_daemons"])
+        .cleanup_inactive_browser_use_daemons(close_all=True),
+    )
 
     _install._discover_homebrew_node_dirs.cache_clear()
     # Each resolved flag flips BEFORE its cache is nulled so a concurrent reader never

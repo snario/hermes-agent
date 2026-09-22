@@ -231,3 +231,28 @@ def test_onepassword_backend_env_forwards_config_directory(monkeypatch):
     backend = OnePasswordLoginBackend({"enabled": True})
 
     assert backend._env(None)["OP_CONFIG_DIR"] == "/tmp/op-config"
+
+
+def test_onepassword_service_account_resolves_items_with_their_vault():
+    """Service accounts require --vault on item get; reuse the vault metadata already returned by item list."""
+    from agent.vault_backends.onepassword import OnePasswordLoginBackend
+
+    items = json.dumps([{
+        "id": "air", "title": "Airline", "additional_information": "123456789",
+        "urls": [{"href": "https://airline.example"}], "vault": {"id": "travel-vault"},
+    }])
+    calls = []
+
+    def fake_run(*args):
+        calls.append(args)
+        return items if args[:2] == ("item", "list") else "resolved\n"
+
+    with patch("agent.secret_scope.get_secret", return_value="service-token"):
+        backend = OnePasswordLoginBackend({"enabled": True})
+    with patch.object(backend, "_run", side_effect=fake_run):
+        assert backend.get_meta("op:air") is not None
+        assert backend.resolve_password("op:air") == "resolved"
+        assert backend.resolve_otp("op:air") is None
+
+    get_calls = [call for call in calls if call[:2] == ("item", "get")]
+    assert all(call[3:5] == ("--vault", "travel-vault") for call in get_calls)

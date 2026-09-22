@@ -394,6 +394,19 @@ class TestRealProfileCdpLaunch:
         assert bt_real_profile._cdp_on_data_dir("http://127.0.0.1:41000", str(tmp_path))
         assert not bt_real_profile._cdp_on_data_dir("http://127.0.0.1:9999", str(tmp_path))
 
+    def test_surviving_chrome_falls_back_to_profile_process_listener(self, tmp_path):
+        proc = Mock(info={"cmdline": ["chrome", f"--user-data-dir={tmp_path}"]})
+        proc.net_connections.return_value = [
+            Mock(status="LISTEN", laddr=Mock(ip="127.0.0.1", port=48123))
+        ]
+        version = Mock()
+        version.json.return_value = {
+            "webSocketDebuggerUrl": "ws://127.0.0.1:48123/devtools/browser/live"
+        }
+
+        with patch("psutil.process_iter", return_value=[proc]), patch("requests.get", return_value=version):
+            assert bt_real_profile._surviving_chrome_cdp(str(tmp_path)) == "http://127.0.0.1:48123"
+
 
 class TestConsentConfigRead:
     """Unmocked config read: _use_real_profile against a real config.yaml."""
@@ -1011,15 +1024,26 @@ class TestReviewRound3:
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
         proc = Mock(returncode=0, stdout="", stderr="")
+
+        class FakeChrome:
+            def poll(self):
+                return None
+
+        def fake_popen(*_args, **_kwargs):
+            (tmp_path / "DevToolsActivePort").write_text("9251\n/devtools/browser/x\n")
+            return FakeChrome()
+
         with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
              patch.object(bt_lightpanda_fallback, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
              patch("hermes_cli.browser_connect.snapshot_real_profile",
                    return_value=(str(tmp_path), None)) as snap, \
+             patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
              patch.object(bt_real_profile, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
              patch.object(bt.subprocess, "run", return_value=proc), \
              patch.object(bt_cloud, "_is_headed_mode", return_value=False):
             cdp, err = bt_real_profile._real_profile_cdp()

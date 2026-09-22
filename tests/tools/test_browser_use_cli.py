@@ -135,6 +135,8 @@ class TestSubprocessEnvironment:
         monkeypatch.setitem(sys.modules, "tools.browser_tool", browser_tool)
         env = bu_cli._base_subprocess_env()
         assert env["ANONYMIZED_TELEMETRY"] == "false"
+        assert env["BH_RUNTIME_DIR_SHARED"] == "1"
+        assert "hermes-bu-" in env["BH_RUNTIME_DIR"]
 
     def test_subprocess_env_strips_parent_python_import_paths(self, monkeypatch):
         """#83427/#84841/#86006/#86104: the browser-use CLI runs under its
@@ -500,6 +502,37 @@ class TestBackendCdpResolution:
         env = self._env()
         assert bu_cli._resolve_backend_cdp(env, "t1", session_name="r7k2") is None
         assert _fake_managed_chromium[-1][0] == "bu-named-r7k2"  # named session → its own Chromium
+
+    def test_persistent_profile_reuses_surviving_chrome(self, monkeypatch, tmp_path, _fake_managed_chromium):
+        monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+        monkeypatch.setattr(
+            "tools.browser_tool_real_profile._surviving_chrome_cdp",
+            lambda path: "http://127.0.0.1:48123" if path == str(tmp_path) else None,
+        )
+        env = {"AGENT_BROWSER_PROFILE": str(tmp_path)}
+
+        assert bu_cli._resolve_backend_cdp(env, "t2", session_name="persisted") is None
+        assert env["BU_CDP_URL"] == "http://127.0.0.1:48123"
+        assert bu_cli._PRIVATE_BROWSER_SENTINEL not in env
+        assert _fake_managed_chromium == []
+
+    def test_persistent_profile_uses_one_shared_backend_for_named_sessions(
+        self, monkeypatch, tmp_path, _fake_managed_chromium
+    ):
+        monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+        monkeypatch.setattr("tools.browser_tool_real_profile._surviving_chrome_cdp", lambda _path: None)
+
+        first = {"AGENT_BROWSER_PROFILE": str(tmp_path)}
+        second = {"AGENT_BROWSER_PROFILE": str(tmp_path)}
+        assert bu_cli._resolve_backend_cdp(first, "t1", session_name="one") is None
+        assert bu_cli._resolve_backend_cdp(second, "t2", session_name="two") is None
+
+        assert _fake_managed_chromium[0][0] == _fake_managed_chromium[1][0]
+        assert _fake_managed_chromium[0][0].startswith("persistent-profile-")
+        assert bu_cli._PRIVATE_BROWSER_SENTINEL not in first
+        assert bu_cli._PRIVATE_BROWSER_SENTINEL not in second
 
     def test_packaged_chromium_launch_failure_is_an_error(self, monkeypatch):
         monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
@@ -998,6 +1031,53 @@ class TestSkillTextDescription:
 
 
 class TestBrowserExec:
+    def test_fill_input_timeout_uses_native_setter(self):
+        scripts = []
+
+        def timed_out(*args, **kwargs):
+            raise TimeoutError
+
+        namespace = {
+            "fill_input": timed_out,
+            "js": lambda script: scripts.append(script) or True,
+        }
+        exec(bu_cli._INPUT_TIMEOUT_FALLBACK_PREAMBLE, namespace)
+
+        namespace["fill_input"]("input[type=email]", "liam@example.com")
+
+        assert "HTMLInputElement.prototype" in scripts[0]
+        assert 'v="liam@example.com"' in scripts[0]
+
+    def test_daemon_janitor_stops_only_stale_inactive_sessions(self, tmp_path, monkeypatch):
+        runtime = str(tmp_path)
+        stale = tmp_path / "bu-stale.pid"
+        fresh = tmp_path / "bu-fresh.pid"
+        stale.write_text("1")
+        fresh.write_text("2")
+        os.utime(stale, (1, 1))
+        os.utime(fresh, (99, 99))
+        stopped = []
+        monkeypatch.setattr(bu_cli, "_stop_browser_use_daemon", lambda path, name: stopped.append((path, name)) or True)
+        monkeypatch.setattr("tools.browser_tool.BROWSER_SESSION_INACTIVITY_TIMEOUT", 20)
+        with bu_cli._DAEMON_LOCK:
+            old_dirs, old_active = set(bu_cli._DAEMON_RUNTIME_DIRS), set(bu_cli._ACTIVE_DAEMONS)
+            bu_cli._DAEMON_RUNTIME_DIRS.clear()
+            bu_cli._DAEMON_RUNTIME_DIRS.add(runtime)
+            bu_cli._ACTIVE_DAEMONS.clear()
+            bu_cli._ACTIVE_DAEMONS.add((runtime, "stale"))
+        try:
+            assert bu_cli.cleanup_inactive_browser_use_daemons(now=100) == 0
+            with bu_cli._DAEMON_LOCK:
+                bu_cli._ACTIVE_DAEMONS.clear()
+            assert bu_cli.cleanup_inactive_browser_use_daemons(now=100) == 1
+            assert stopped == [(runtime, "stale")]
+        finally:
+            with bu_cli._DAEMON_LOCK:
+                bu_cli._DAEMON_RUNTIME_DIRS.clear()
+                bu_cli._DAEMON_RUNTIME_DIRS.update(old_dirs)
+                bu_cli._ACTIVE_DAEMONS.clear()
+                bu_cli._ACTIVE_DAEMONS.update(old_active)
+
     def test_missing_cli_returns_install_hint(self, monkeypatch):
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
         result = json.loads(bu_cli.browser_exec("print(page_info())"))
@@ -1013,7 +1093,7 @@ class TestBrowserExec:
         result = json.loads(bu_cli.browser_exec('print("hi")'))
         assert result["success"] is True
         assert result["exit_code"] == 0
-        assert 'got:print("hi")' in result["output"]
+        assert result["output"].rstrip().endswith('print("hi")')
         assert "session" not in result
 
     def test_session_sets_bu_name(self, tmp_path, monkeypatch):

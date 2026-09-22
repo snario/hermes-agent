@@ -35,6 +35,7 @@ class OnePasswordLoginBackend(LoginBackend):
 
     def __init__(self, cfg: Optional[Dict] = None):
         self.cfg = cfg or {}
+        self._item_vaults: Dict[str, str] = {}
         from agent.secret_scope import get_secret
         env_name = str(self.cfg.get("service_account_token_env") or "OP_SERVICE_ACCOUNT_TOKEN")
         self._service_token = get_secret(env_name, "") or ""
@@ -104,6 +105,10 @@ class OnePasswordLoginBackend(LoginBackend):
         raw = json.loads(self._run("item", "list", "--categories", "Login", "--format", "json") or "[]")
         out: List[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
+            item_id = str(item.get("id") or "")
+            vault_id = str((item.get("vault") or {}).get("id") or "")
+            if item_id and vault_id:
+                self._item_vaults[item_id] = vault_id
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origins = _all_origins(urls)
             if not origins:
@@ -119,14 +124,20 @@ class OnePasswordLoginBackend(LoginBackend):
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
         return next((m for m in self.list_items() if m.id == handle), None)
 
-    def resolve_password(self, handle: str) -> str:
+    def _item_get_args(self, handle: str) -> List[str]:
         item_id = handle[len(self.prefix):]
-        return self._run("item", "get", item_id, "--fields", "label=password", "--reveal").rstrip("\r\n")
+        if self._service_token and item_id not in self._item_vaults:
+            self.list_items()
+        vault_id = self._item_vaults.get(item_id)
+        return ["item", "get", item_id, *(["--vault", vault_id] if vault_id else [])]
+
+    def resolve_password(self, handle: str) -> str:
+        return self._run(*self._item_get_args(handle), "--fields", "label=password", "--reveal").rstrip("\r\n")
 
     def resolve_otp(self, handle: str) -> Optional[str]:
         # `--otp` mints the current TOTP from the item's one-time-password field; items without one error out.
         try:
-            code = self._run("item", "get", handle[len(self.prefix):], "--otp").strip()
+            code = self._run(*self._item_get_args(handle), "--otp").strip()
         except Exception:
             return None
         return code if code.isdigit() else None

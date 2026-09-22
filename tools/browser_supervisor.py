@@ -275,6 +275,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return _fail("supervisor loop is not running")
 
         async def _attach(target_id: str) -> str:
+            await self._cdp("Target.activateTarget", {"targetId": target_id}, timeout=timeout)
             attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
             sid = attach["result"]["sessionId"]
             await self._enable_page_domains(sid, timeout=timeout)

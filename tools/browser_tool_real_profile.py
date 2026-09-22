@@ -84,22 +84,46 @@ def _read_devtools_port(data_dir: str) -> Optional[str]:
 def _surviving_chrome_cdp(data_dir: str) -> Optional[str]:
     """HTTP CDP root of a Chrome still running on ``data_dir``, or None. ``DevToolsActivePort``
     outlives a crashed Chrome and its port can be recycled by another local CDP server, so the
-    file's browser id (line 2) must match what ``/json/version`` reports before it is trusted."""
+    file's browser id (line 2) must match what ``/json/version`` reports before it is trusted.
+    agent-browser removes that file when its daemon exits even if persistent-profile Chrome stays
+    alive, so fall back to the verified profile owner's loopback listeners."""
     try:
         with open(os.path.join(data_dir, "DevToolsActivePort"), encoding="utf-8") as fh:
             port, browser_path = fh.readline().strip(), fh.readline().strip()
     except OSError:
-        return None
-    if not port.isdigit() or not browser_path.startswith("/devtools/browser/"):
-        return None
-    http_cdp = f"http://127.0.0.1:{port}"
+        port = browser_path = ""
+    if port.isdigit() and browser_path.startswith("/devtools/browser/"):
+        http_cdp = f"http://127.0.0.1:{port}"
+        try:
+            import requests
+            ws_url = str(requests.get(f"{http_cdp}/json/version", timeout=2, **loopback_request_kwargs(http_cdp))
+                         .json().get("webSocketDebuggerUrl") or "")
+            if ws_url.endswith(browser_path):
+                return http_cdp
+        except Exception:
+            pass
+
     try:
+        import psutil
         import requests
-        ws_url = str(requests.get(f"{http_cdp}/json/version", timeout=2, **loopback_request_kwargs(http_cdp))
-                     .json().get("webSocketDebuggerUrl") or "")
+        wanted = os.path.normcase(os.path.realpath(data_dir))
+        for proc in psutil.process_iter(["cmdline"]):
+            argv = proc.info.get("cmdline") or []
+            profile_args = [arg.split("=", 1)[1] for arg in argv if arg.startswith("--user-data-dir=")]
+            if not profile_args or os.path.normcase(os.path.realpath(profile_args[-1])) != wanted:
+                continue
+            for conn in proc.net_connections(kind="tcp"):
+                if conn.status != psutil.CONN_LISTEN or not conn.laddr or conn.laddr.ip != "127.0.0.1":
+                    continue
+                http_cdp = f"http://127.0.0.1:{conn.laddr.port}"
+                ws_url = str(requests.get(
+                    f"{http_cdp}/json/version", timeout=2, **loopback_request_kwargs(http_cdp)
+                ).json().get("webSocketDebuggerUrl") or "")
+                if ws_url.startswith(f"ws://127.0.0.1:{conn.laddr.port}/devtools/browser/"):
+                    return http_cdp
     except Exception:
-        return None
-    return http_cdp if ws_url.endswith(browser_path) else None
+        pass
+    return None
 
 
 def _cdp_on_data_dir(http_cdp: str, data_dir: str) -> bool:

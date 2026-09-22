@@ -134,6 +134,7 @@ class TestBrowserPassthroughPattern:
             "BROWSERBASE_API_KEY": "bb-key",
             "BROWSERBASE_PROJECT_ID": "bb-proj",
             "FIRECRAWL_API_KEY": "fc-key",
+            "AGENT_BROWSER_PROFILE": "/tmp/hermes-browser-profile",
             "ANTHROPIC_API_KEY": "ant-should-go",
             "TELEGRAM_BOT_TOKEN": "bot-should-go",
         }
@@ -145,6 +146,7 @@ class TestBrowserPassthroughPattern:
 
         assert env["BROWSERBASE_API_KEY"] == "bb-key"
         assert env["FIRECRAWL_API_KEY"] == "fc-key"
+        assert env["AGENT_BROWSER_PROFILE"] == "/tmp/hermes-browser-profile"
         # Provider + gateway secrets must NOT come back.
         assert "ANTHROPIC_API_KEY" not in env
         assert "TELEGRAM_BOT_TOKEN" not in env
