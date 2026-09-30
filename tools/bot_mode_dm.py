@@ -825,4 +825,8 @@ def _session_title(agent: Any) -> str:
 
 if __name__ == "__main__":  # pragma: no cover - exercised as a background process
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    # Store Python has no application dependencies until bootstrap activates the
+    # selected PM generation. Background runners cannot inherit the parent's sys.path.
+    import hermes_bootstrap  # noqa: F401
+
     raise SystemExit(_delivery_main(sys.argv[1:]))
