@@ -370,10 +370,13 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 
 
 def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from ``<home>/.env`` plus its external
+    """Build a profile's secret mapping from ``.op.env``, ``.env`` and external
     secret sources. Global vars are NOT copied in — ``get_secret`` reads those
     from ``os.environ`` — so the scope holds only profile secrets."""
-    secrets = load_env_file(Path(hermes_home) / ".env")
+    # The standalone loader reads .op.env for bootstrap authentication too.
+    # Routed activities need the owning profile's copy, never the launch env.
+    secrets = load_env_file(Path(hermes_home) / ".op.env")
+    secrets.update(load_env_file(Path(hermes_home) / ".env"))
     try:
         from hermes_cli.env_loader import get_secret_source_values
         external_secrets = get_secret_source_values(Path(hermes_home))
